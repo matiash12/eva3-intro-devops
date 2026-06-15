@@ -29,8 +29,7 @@ eva3-intro-devops/
 │   ├── backend-deployment.yaml
 │   ├── backend-service.yaml
 │   ├── frontend-deployment.yaml
-│   ├── frontend-service.yaml
-│   ├── ingress.yaml           # ALB Ingress Controller
+│   ├── frontend-service.yaml  # tipo LoadBalancer — expone el frontend públicamente
 │   ├── hpa-backend.yaml       # HPA backend (CPU 50%, 2-6 réplicas)
 │   └── hpa-frontend.yaml      # HPA frontend (CPU 50%, 2-4 réplicas)
 │
@@ -95,7 +94,7 @@ El archivo `.github/workflows/deploy.yml` se dispara en cada push a `main` y eje
 3. Hace login al ECR de AWS.
 4. Construye la imagen Docker del **backend** y la etiqueta con el SHA corto del commit y `:latest`.
 5. Hace push de ambas etiquetas al repositorio ECR del backend.
-6. Repite los pasos 4-5 para el **frontend** (pasando `REACT_APP_BACKEND_URL` vacío; el frontend usa rutas relativas vía el Ingress).
+6. Repite los pasos 4-5 para el **frontend** (pasando `REACT_APP_BACKEND_URL` vacío; el frontend accede al backend mediante la URL del LoadBalancer directamente).
 
 ### Job 2 — Deploy
 1. Configura credenciales AWS.
@@ -103,7 +102,7 @@ El archivo `.github/workflows/deploy.yml` se dispara en cada push a `main` y eje
 3. Ejecuta `kubectl apply -f k8s/` para crear/actualizar todos los recursos.
 4. Usa `kubectl set image` para fijar la imagen con el SHA exacto del commit en cada Deployment (evita pull de `:latest` que podría no ser consistente).
 5. Espera a que los rollouts de backend y frontend completen (`rollout status`).
-6. Imprime el estado final de pods, servicios, ingress y HPA.
+6. Imprime el estado final de pods, servicios y HPA, y espera hasta 2 minutos por el hostname del LoadBalancer del `frontend-svc`.
 
 ---
 
@@ -189,15 +188,22 @@ kubectl get pods -o wide
 # Esperado: 2 pods de backend + 2 pods de frontend en estado Running
 ```
 
-### 2. Obtener la URL del ALB (Ingress)
+### 2. Obtener la URL pública del frontend (LoadBalancer)
+
+> **Nota sobre AWS Academy:** El entorno AWS Academy (rol `voclabs`) no permite crear OIDC
+> providers ni IAM roles nuevos, lo que impide usar el AWS Load Balancer Controller / Ingress.
+> En su lugar, el `frontend-svc` es de tipo `LoadBalancer`, que EKS provisiona automáticamente
+> como un Classic Load Balancer (CLB) o Network Load Balancer (NLB) sin requerir permisos IAM adicionales.
 
 ```bash
-kubectl get ingress eva3-ingress
-# La columna ADDRESS muestra el hostname del ALB de AWS
+kubectl get svc frontend-svc
+# La columna EXTERNAL-IP muestra el hostname del LoadBalancer de AWS
 # Puede tardar 2-3 minutos en asignarse
 ```
 
-Accede a `http://<ALB-hostname>` en el navegador. Verás la app React con los datos del backend.
+El pipeline de GitHub Actions también imprime la URL al final del job de deploy.
+
+Accede a `http://<EXTERNAL-IP>` en el navegador. Verás la app React.
 
 ### 3. Verificar el autoscaling
 
@@ -248,10 +254,15 @@ git push → GitHub Actions
                │
                ▼
          EKS Cluster (eva3)
-         ┌─────────────────┐
-         │  ALB Ingress    │  ← URL pública
-         │  /    → frontend│
-         │  /api → backend │
-         └─────────────────┘
+         ┌──────────────────────┐
+         │  frontend-svc        │
+         │  (LoadBalancer/CLB)  │ ← URL pública :80
+         │  → frontend pods     │
+         └──────────────────────┘
+         ┌──────────────────────┐
+         │  backend-svc         │
+         │  (ClusterIP)         │ ← acceso interno
+         │  → backend pods      │
+         └──────────────────────┘
               HPA activo
 ```

@@ -123,7 +123,22 @@ jobs:
           kubectl get pods -o wide
           echo "=== Services ==="
           kubectl get services
-          echo "=== Ingress ==="
-          kubectl get ingress
           echo "=== HPA ==="
           kubectl get hpa
+
+      - name: Obtener URL pública del frontend (LoadBalancer)
+        run: |
+          echo "Esperando hostname del LoadBalancer (puede tardar ~2 min)..."
+          for i in $(seq 1 24); do
+            HOSTNAME=$(kubectl get svc frontend-svc \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            if [ -n "$HOSTNAME" ]; then
+              echo ""
+              echo "✅ Frontend disponible en: http://$HOSTNAME"
+              exit 0
+            fi
+            echo "  intento $i/24 — sin hostname aún, reintentando en 5s..."
+            sleep 5
+          done
+          echo "⚠️  El LoadBalancer aún no tiene hostname asignado."
+          echo "   Ejecuta: kubectl get svc frontend-svc"
