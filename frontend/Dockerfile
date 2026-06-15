@@ -1,12 +1,14 @@
 # Stage 1: Build React app
 FROM node:20-alpine AS builder
 WORKDIR /app
-COPY package.json ./
-RUN npm install --legacy-peer-deps
+COPY package.json package-lock.json ./
+RUN npm ci --legacy-peer-deps
 COPY public ./public
 COPY src ./src
 ARG REACT_APP_BACKEND_URL
 ENV REACT_APP_BACKEND_URL=$REACT_APP_BACKEND_URL
+# Disable the CRA eslint webpack plugin to avoid eslint@8 hoisting conflicts
+ENV DISABLE_ESLINT_PLUGIN=true
 RUN npm run build
 
 # Stage 2: Serve with Nginx
