@@ -30,8 +30,8 @@ eva3-intro-devops/
 │   ├── backend-service.yaml
 │   ├── frontend-deployment.yaml
 │   ├── frontend-service.yaml  # tipo LoadBalancer — expone el frontend públicamente
-│   ├── hpa-backend.yaml       # HPA backend (CPU 50%, 2-6 réplicas)
-│   └── hpa-frontend.yaml      # HPA frontend (CPU 50%, 2-4 réplicas)
+│   ├── hpa-backend.yaml       # HPA backend (CPU 50%, 2-5 réplicas)
+│   └── hpa-frontend.yaml      # HPA frontend (CPU 50%, 2-5 réplicas)
 │
 └── .github/workflows/
     └── deploy.yml             # Pipeline CI/CD GitHub Actions
@@ -180,15 +180,55 @@ Además, el usuario debe estar en el `aws-auth` ConfigMap del cluster EKS (ver s
 
 ## Autoscaling (HPA)
 
-| Componente | Min réplicas | Max réplicas | Umbral CPU |
-|---|---|---|---|
-| backend | 2 | 6 | 50% |
-| frontend | 2 | 4 | 50% |
+### Qué es el HPA
 
-El HPA requiere que **Metrics Server** esté instalado en el cluster:
+El **HorizontalPodAutoscaler** es un recurso de Kubernetes que ajusta automáticamente
+el número de réplicas de un Deployment según la utilización de CPU (u otras métricas).
+Cuando la carga sube, crea pods adicionales; cuando baja, los elimina, respetando
+siempre los límites de `minReplicas` y `maxReplicas`.
+
+El HPA necesita el **Metrics Server** para obtener las métricas de CPU de los pods
+(en este entorno ya está instalado y `kubectl top nodes` devuelve resultados).
+
+### Configuración
+
+| Componente | Archivo | Min réplicas | Max réplicas | Umbral CPU |
+|---|---|---|---|---|
+| backend | `k8s/hpa-backend.yaml` | 2 | 5 | 50% |
+| frontend | `k8s/hpa-frontend.yaml` | 2 | 5 | 50% |
+
+Ambos HPAs usan `autoscaling/v2` y la métrica `Resource > cpu > Utilization`.
+Los Deployments ya definen `resources.requests.cpu` (requerido para que el HPA
+pueda calcular el porcentaje real de utilización):
+
+| Componente | requests.cpu | limits.cpu |
+|---|---|---|
+| backend | 250m | 500m |
+| frontend | 100m | 200m |
+
+### Por qué 50% como umbral
+
+El 50% es el punto de equilibrio estándar para cargas variables:
+
+- **Por debajo (ej. 70–80%):** los pods llegan casi al límite antes de que se agregue
+  capacidad, lo que puede causar picos de latencia mientras el nuevo pod arranca.
+- **Por encima (ej. 20–30%):** se escala demasiado pronto y se desperdician recursos
+  (y dinero en nodos EC2) con pods casi ociosos.
+- **50%:** deja margen suficiente para absorber picos de corta duración sin escalar
+  innecesariamente, y escala antes de que la latencia se degrade.
+
+### Verificar el autoscaling en funcionamiento
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+# Estado actual del HPA (muestra réplicas actuales y uso de CPU)
+kubectl get hpa
+
+# Monitorear en tiempo real mientras aumenta la carga
+kubectl get hpa --watch
+
+# Generar carga artificial para disparar el escalado
+kubectl run -it --rm load-test --image=busybox --restart=Never -- \
+  sh -c "while true; do wget -q -O- http://backend-svc/api/health > /dev/null; done"
 ```
 
 ---
@@ -223,17 +263,8 @@ El pipeline imprime ambas URLs en los logs de GitHub Actions. Accede a
 
 ### 3. Verificar el autoscaling
 
-```bash
-# Ver estado actual del HPA
-kubectl get hpa
-
-# Generar carga para disparar el escalado (desde otra terminal)
-kubectl run -it --rm load-test --image=busybox --restart=Never -- \
-  sh -c "while true; do wget -q -O- http://backend-svc/api/health > /dev/null; done"
-
-# Observar cómo el HPA aumenta réplicas
-kubectl get hpa --watch
-```
+Ver la sección [Autoscaling (HPA)](#autoscaling-hpa) más abajo para los comandos
+de verificación y cómo generar carga artificial.
 
 ### 4. Ver logs de los pods
 
