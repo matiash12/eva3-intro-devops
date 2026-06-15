@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: eva3-ingress
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /
+spec:
+  rules:
+    - http:
+        paths:
+          # El frontend sirve la SPA en "/"
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-svc
+                port:
+                  number: 80
+          # Las llamadas /api/* van al backend
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-svc
+                port:
+                  number: 80
