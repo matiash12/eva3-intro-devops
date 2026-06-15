@@ -5,8 +5,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --legacy-peer-deps
 COPY public ./public
 COPY src ./src
-ARG REACT_APP_BACKEND_URL
-ENV REACT_APP_BACKEND_URL=$REACT_APP_BACKEND_URL
+ARG REACT_APP_API_URL
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
 # Disable the CRA eslint webpack plugin to avoid eslint@8 hoisting conflicts
 ENV DISABLE_ESLINT_PLUGIN=true
 RUN npm run build

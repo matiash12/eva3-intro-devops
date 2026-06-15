@@ -86,23 +86,37 @@ docker run -p 3000:80 eva3-frontend
 
 ## Cómo funciona el pipeline CI/CD
 
-El archivo `.github/workflows/deploy.yml` se dispara en cada push a `main` y ejecuta dos jobs en secuencia:
+El archivo `.github/workflows/deploy.yml` se dispara en cada push a `main` y ejecuta **4 jobs en cadena**:
 
-### Job 1 — Build & Push
-1. Hace checkout del código.
-2. Configura credenciales AWS usando los GitHub Secrets.
-3. Hace login al ECR de AWS.
-4. Construye la imagen Docker del **backend** y la etiqueta con el SHA corto del commit y `:latest`.
-5. Hace push de ambas etiquetas al repositorio ECR del backend.
-6. Repite los pasos 4-5 para el **frontend** (pasando `REACT_APP_BACKEND_URL` vacío; el frontend accede al backend mediante la URL del LoadBalancer directamente).
+```
+build-backend ──► deploy-backend ──► build-frontend ──► deploy-frontend
+```
 
-### Job 2 — Deploy
-1. Configura credenciales AWS.
-2. Actualiza el `kubeconfig` local apuntando al cluster `eva3` en `us-east-1`.
-3. Ejecuta `kubectl apply -f k8s/` para crear/actualizar todos los recursos.
-4. Usa `kubectl set image` para fijar la imagen con el SHA exacto del commit en cada Deployment (evita pull de `:latest` que podría no ser consistente).
-5. Espera a que los rollouts de backend y frontend completen (`rollout status`).
-6. Imprime el estado final de pods, servicios y HPA, y espera hasta 2 minutos por el hostname del LoadBalancer del `frontend-svc`.
+### Por qué este orden importa
+
+React "hornea" las variables de entorno en el bundle JavaScript **en build-time**, no en runtime. La URL pública del backend (`REACT_APP_API_URL`) se conoce solo después de que EKS provisione el LoadBalancer, lo que ocurre cuando se despliega el backend. Por eso el build del frontend **debe** hacerse después del deploy del backend.
+
+### Job 1 — Build backend
+1. Construye la imagen Docker del backend y la etiqueta con el SHA corto del commit.
+2. Hace push de las etiquetas `:<sha>` y `:latest` al ECR del backend.
+
+### Job 2 — Deploy backend & obtener URL
+1. Aplica los manifiestos del backend (`deployment`, `service`, `hpa`).
+2. Fija la imagen con el SHA exacto del commit (`kubectl set image`).
+3. Espera a que el rollout complete.
+4. Espera hasta 2 minutos por el hostname del LoadBalancer del `backend-svc`.
+5. Expone ese hostname como output (`backend-url`) para el siguiente job.
+
+### Job 3 — Build frontend
+1. Recibe `backend-url` del job anterior como variable de entorno.
+2. Construye la imagen Docker del frontend pasando `REACT_APP_API_URL=http://<backend-lb-hostname>` como build-arg, de modo que queda permanentemente incorporado en el bundle de producción.
+3. Hace push de la imagen al ECR del frontend.
+
+### Job 4 — Deploy frontend
+1. Aplica los manifiestos del frontend (`deployment`, `service`, `hpa`).
+2. Fija la imagen con el SHA exacto del commit.
+3. Espera a que el rollout complete.
+4. Imprime la URL pública del frontend.
 
 ---
 
@@ -188,22 +202,24 @@ kubectl get pods -o wide
 # Esperado: 2 pods de backend + 2 pods de frontend en estado Running
 ```
 
-### 2. Obtener la URL pública del frontend (LoadBalancer)
+### 2. Obtener las URLs públicas (LoadBalancers)
 
 > **Nota sobre AWS Academy:** El entorno AWS Academy (rol `voclabs`) no permite crear OIDC
-> providers ni IAM roles nuevos, lo que impide usar el AWS Load Balancer Controller / Ingress.
-> En su lugar, el `frontend-svc` es de tipo `LoadBalancer`, que EKS provisiona automáticamente
-> como un Classic Load Balancer (CLB) o Network Load Balancer (NLB) sin requerir permisos IAM adicionales.
+> providers ni IAM roles nuevos. Ambos servicios usan `type: LoadBalancer`; EKS provisiona
+> un Classic Load Balancer (CLB) automáticamente sin requerir permisos IAM adicionales.
 
 ```bash
+# URL del backend (capturada automáticamente por el pipeline)
+kubectl get svc backend-svc
+# → EXTERNAL-IP = hostname del LB del backend
+
+# URL del frontend (impresa al final del último job del pipeline)
 kubectl get svc frontend-svc
-# La columna EXTERNAL-IP muestra el hostname del LoadBalancer de AWS
-# Puede tardar 2-3 minutos en asignarse
+# → EXTERNAL-IP = hostname del LB del frontend
 ```
 
-El pipeline de GitHub Actions también imprime la URL al final del job de deploy.
-
-Accede a `http://<EXTERNAL-IP>` en el navegador. Verás la app React.
+El pipeline imprime ambas URLs en los logs de GitHub Actions. Accede a
+`http://<frontend-EXTERNAL-IP>` en el navegador para ver la app React completa.
 
 ### 3. Verificar el autoscaling
 
@@ -257,12 +273,12 @@ git push → GitHub Actions
          ┌──────────────────────┐
          │  frontend-svc        │
          │  (LoadBalancer/CLB)  │ ← URL pública :80
-         │  → frontend pods     │
+         │  → frontend pods     │   (bundle incluye URL del backend)
          └──────────────────────┘
          ┌──────────────────────┐
          │  backend-svc         │
-         │  (ClusterIP)         │ ← acceso interno
-         │  → backend pods      │
+         │  (LoadBalancer/CLB)  │ ← URL pública :80
+         │  → backend pods      │   (hostname capturado en build-time)
          └──────────────────────┘
               HPA activo
 ```

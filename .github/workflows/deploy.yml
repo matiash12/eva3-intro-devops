@@ -10,15 +10,21 @@ env:
   ECR_BACKEND: 821111072781.dkr.ecr.us-east-1.amazonaws.com/eva3-backend
   ECR_FRONTEND: 821111072781.dkr.ecr.us-east-1.amazonaws.com/eva3-frontend
 
+# ─── Orden de ejecución ───────────────────────────────────────────────────────
+#
+#  build-backend ──► deploy-backend ──► build-frontend ──► deploy-frontend
+#
+# El frontend se construye DESPUÉS de desplegar el backend porque la URL pública
+# del LoadBalancer del backend no existe hasta que EKS la provisiona. React hornea
+# esa URL en el bundle en build-time (REACT_APP_API_URL), por lo que el build
+# del frontend debe ocurrir después de obtener el hostname real del backend.
+# ─────────────────────────────────────────────────────────────────────────────
+
 jobs:
-  # ─────────────────────────────────────────────
-  # Job 1: Build y push de imágenes Docker a ECR
-  # ─────────────────────────────────────────────
-  build-and-push:
-    name: Build & Push Docker images
+  # ── Job 1: Build y push de la imagen del backend ─────────────────────────
+  build-backend:
+    name: Build & Push backend
     runs-on: ubuntu-latest
-    outputs:
-      image-tag: ${{ steps.meta.outputs.tag }}
 
     steps:
       - name: Checkout código
@@ -33,47 +39,25 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login a Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Generar tag de imagen (SHA corto)
-        id: meta
-        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
-
-      # ── Backend ──────────────────────────────
-      - name: Build imagen backend
+      - name: Build y push imagen backend
         run: |
+          IMAGE_TAG=${GITHUB_SHA::8}
           docker build \
-            -t $ECR_BACKEND:${{ steps.meta.outputs.tag }} \
+            -t $ECR_BACKEND:${IMAGE_TAG} \
             -t $ECR_BACKEND:latest \
             ./backend
-
-      - name: Push imagen backend a ECR
-        run: |
-          docker push $ECR_BACKEND:${{ steps.meta.outputs.tag }}
+          docker push $ECR_BACKEND:${IMAGE_TAG}
           docker push $ECR_BACKEND:latest
 
-      # ── Frontend ─────────────────────────────
-      - name: Build imagen frontend
-        run: |
-          docker build \
-            --build-arg REACT_APP_BACKEND_URL="" \
-            -t $ECR_FRONTEND:${{ steps.meta.outputs.tag }} \
-            -t $ECR_FRONTEND:latest \
-            ./frontend
-
-      - name: Push imagen frontend a ECR
-        run: |
-          docker push $ECR_FRONTEND:${{ steps.meta.outputs.tag }}
-          docker push $ECR_FRONTEND:latest
-
-  # ─────────────────────────────────────────────
-  # Job 2: Deploy a EKS
-  # ─────────────────────────────────────────────
-  deploy:
-    name: Deploy to EKS
+  # ── Job 2: Deploy del backend + obtener URL pública ──────────────────────
+  deploy-backend:
+    name: Deploy backend & get LB URL
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: build-backend
+    outputs:
+      backend-url: ${{ steps.lb.outputs.url }}
 
     steps:
       - name: Checkout código
@@ -92,32 +76,122 @@ jobs:
         with:
           version: 'v1.29.0'
 
-      - name: Actualizar kubeconfig para el cluster EKS
+      - name: Actualizar kubeconfig
         run: |
           aws eks update-kubeconfig \
             --region ${{ env.AWS_REGION }} \
             --name ${{ env.EKS_CLUSTER }}
 
-      - name: Aplicar manifiestos de Kubernetes
-        run: kubectl apply -f k8s/
+      - name: Aplicar manifiestos del backend
+        run: |
+          kubectl apply -f k8s/backend-deployment.yaml
+          kubectl apply -f k8s/backend-service.yaml
+          kubectl apply -f k8s/hpa-backend.yaml
 
-      - name: Actualizar imagen del backend en el Deployment
+      - name: Actualizar imagen del backend
         run: |
           kubectl set image deployment/backend \
-            backend=$ECR_BACKEND:${{ needs.build-and-push.outputs.image-tag }}
-
-      - name: Actualizar imagen del frontend en el Deployment
-        run: |
-          kubectl set image deployment/frontend \
-            frontend=$ECR_FRONTEND:${{ needs.build-and-push.outputs.image-tag }}
+            backend=$ECR_BACKEND:${GITHUB_SHA::8}
 
       - name: Esperar rollout del backend
         run: kubectl rollout status deployment/backend --timeout=120s
 
+      - name: Esperar y capturar hostname del LoadBalancer del backend
+        id: lb
+        run: |
+          echo "Esperando hostname del LoadBalancer del backend (hasta 2 min)..."
+          for i in $(seq 1 24); do
+            HOSTNAME=$(kubectl get svc backend-svc \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            if [ -n "$HOSTNAME" ]; then
+              echo "Backend LB hostname: $HOSTNAME"
+              echo "url=http://$HOSTNAME" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "  intento $i/24 — reintentando en 5s..."
+            sleep 5
+          done
+          echo "ERROR: El LoadBalancer del backend no obtuvo hostname en 2 minutos."
+          exit 1
+
+  # ── Job 3: Build y push de la imagen del frontend (con URL del backend) ──
+  build-frontend:
+    name: Build & Push frontend
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login a Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build y push imagen frontend (con REACT_APP_API_URL real)
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::8}
+          BACKEND_URL="${{ needs.deploy-backend.outputs.backend-url }}"
+          echo "Construyendo frontend con REACT_APP_API_URL=$BACKEND_URL"
+          docker build \
+            --build-arg REACT_APP_API_URL="$BACKEND_URL" \
+            -t $ECR_FRONTEND:${IMAGE_TAG} \
+            -t $ECR_FRONTEND:latest \
+            ./frontend
+          docker push $ECR_FRONTEND:${IMAGE_TAG}
+          docker push $ECR_FRONTEND:latest
+
+  # ── Job 4: Deploy del frontend ────────────────────────────────────────────
+  deploy-frontend:
+    name: Deploy frontend
+    runs-on: ubuntu-latest
+    needs: build-frontend
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.29.0'
+
+      - name: Actualizar kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER }}
+
+      - name: Aplicar manifiestos del frontend
+        run: |
+          kubectl apply -f k8s/frontend-deployment.yaml
+          kubectl apply -f k8s/frontend-service.yaml
+          kubectl apply -f k8s/hpa-frontend.yaml
+
+      - name: Actualizar imagen del frontend
+        run: |
+          kubectl set image deployment/frontend \
+            frontend=$ECR_FRONTEND:${GITHUB_SHA::8}
+
       - name: Esperar rollout del frontend
         run: kubectl rollout status deployment/frontend --timeout=120s
 
-      - name: Mostrar estado final de los pods
+      - name: Mostrar estado final
         run: |
           echo "=== Pods ==="
           kubectl get pods -o wide
@@ -126,19 +200,19 @@ jobs:
           echo "=== HPA ==="
           kubectl get hpa
 
-      - name: Obtener URL pública del frontend (LoadBalancer)
+      - name: Obtener URL pública del frontend
         run: |
-          echo "Esperando hostname del LoadBalancer (puede tardar ~2 min)..."
+          echo "Esperando hostname del LoadBalancer del frontend (hasta 2 min)..."
           for i in $(seq 1 24); do
             HOSTNAME=$(kubectl get svc frontend-svc \
               -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
             if [ -n "$HOSTNAME" ]; then
               echo ""
-              echo "✅ Frontend disponible en: http://$HOSTNAME"
+              echo "Frontend disponible en: http://$HOSTNAME"
               exit 0
             fi
-            echo "  intento $i/24 — sin hostname aún, reintentando en 5s..."
+            echo "  intento $i/24 — reintentando en 5s..."
             sleep 5
           done
-          echo "⚠️  El LoadBalancer aún no tiene hostname asignado."
-          echo "   Ejecuta: kubectl get svc frontend-svc"
+          echo "El LoadBalancer del frontend aun no tiene hostname."
+          echo "Ejecuta: kubectl get svc frontend-svc"
