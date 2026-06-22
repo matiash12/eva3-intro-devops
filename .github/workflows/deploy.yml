@@ -7,8 +7,8 @@ on:
 env:
   AWS_REGION: us-east-1
   EKS_CLUSTER: eva3
-  ECR_BACKEND: 821111072781.dkr.ecr.us-east-1.amazonaws.com/eva3-backend
-  ECR_FRONTEND: 821111072781.dkr.ecr.us-east-1.amazonaws.com/eva3-frontend
+  ECR_BACKEND: 859232183604.dkr.ecr.us-east-1.amazonaws.com/eva3-backend
+  ECR_FRONTEND: 859232183604.dkr.ecr.us-east-1.amazonaws.com/eva3-frontend
 
 # ─── Orden de ejecución ───────────────────────────────────────────────────────
 #

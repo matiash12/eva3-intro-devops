@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: 821111072781.dkr.ecr.us-east-1.amazonaws.com/eva3-frontend:latest
+          image: 859232183604.dkr.ecr.us-east-1.amazonaws.com/eva3-frontend:latest
           ports:
             - containerPort: 80
           resources:
